@@ -55,6 +55,8 @@ def run_inference(cmd):
 
 def inference_task(job_id, voice_info, text, model_name, use_onnx, voice_name):
     """Task function to run in thread"""
+
+    import torch
     logger.info(f"[{job_id}] Starting inference task")
 
     with jobs_lock:
