@@ -52,6 +52,10 @@ def generate_tts(
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise HTTPException(status_code=500, detail=f"Inference failed: {result.stderr}")
+        # If returncode == 0, log stderr as warning but continue
+        elif result.stderr:
+            print("Inference warnings:", result.stderr)
+
 
         # Return the generated WAV
         headers = {"Content-Disposition": 'attachment; filename="output.wav"'}
