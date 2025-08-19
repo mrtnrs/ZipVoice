@@ -18,3 +18,8 @@ jieba
 piper_phonemize
 pypinyin
 setuptools<81
+
+fastapi
+uvicorn
+requests
+python-multipart
