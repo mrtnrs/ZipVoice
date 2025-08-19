@@ -2,13 +2,15 @@ import os
 import subprocess
 import tempfile
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import uuid
-from fastapi import FastAPI, Form, HTTPException, Depends
-from fastapi.responses import StreamingResponse
+import io
+from fastapi import FastAPI, Form, HTTPException, Depends, status
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import APIKeyHeader
-
+from concurrent.futures import ThreadPoolExecutor
+from redis import Redis
+import rq
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +26,11 @@ def get_api_key(api_key: str = Depends(api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return api_key
 
-# Thread pool for CPU-intensive operations
+# Redis and RQ setup
+redis_conn = Redis.from_url(os.getenv("REDIS_URL"))
+queue = rq.Queue(connection=redis_conn)
+
+# Thread pool for CPU-intensive operations (used inside worker if needed)
 executor = ThreadPoolExecutor(max_workers=2)
 
 # Predefined voices mapping
@@ -49,7 +55,45 @@ def run_inference(cmd):
     elif result.stderr:
         logger.warning(f"Inference warnings: {result.stderr}")
 
-@app.post("/tts")
+def inference_task(voice_info, text, model_name, use_onnx, voice_name):
+    """Task function to run in RQ worker"""
+    job = rq.get_current_job()
+    job_id = job.id  # For logging
+    logger.info(f"[{job_id}] Starting inference task")
+
+    fd, res_wav_path = tempfile.mkstemp(suffix='.wav')
+    try:
+        # Build the inference command
+        module = "zipvoice.bin.infer_zipvoice_onnx" if use_onnx else "zipvoice.bin.infer_zipvoice"
+        cmd = [
+            "python", "-m", module,
+            "--model-name", model_name,
+            "--prompt-text", voice_info["transcription"],
+            "--prompt-wav", voice_info["wav_path"],
+            "--text", text,
+            "--res-wav-path", res_wav_path
+        ]
+
+        logger.info(f"[{job_id}] Running inference command")
+        run_inference(cmd)
+
+        with open(res_wav_path, "rb") as f:
+            wav_bytes = f.read()
+
+        job.meta['status'] = 'finished'
+        job.meta['wav_bytes'] = wav_bytes
+        job.meta['voice_name'] = voice_name
+        job.save_meta()
+        logger.info(f"[{job_id}] Inference task completed successfully")
+    except Exception as e:
+        logger.error(f"[{job_id}] Inference task failed: {str(e)}")
+        raise  # RQ will mark as failed
+    finally:
+        os.close(fd)
+        if os.path.exists(res_wav_path):
+            os.remove(res_wav_path)
+
+@app.post("/tts", status_code=status.HTTP_202_ACCEPTED)
 async def generate_tts(
     voice_name: str = Form(..., description="Name of the predefined voice"),
     text: str = Form(..., description="Text to synthesize"),
@@ -57,7 +101,7 @@ async def generate_tts(
     use_onnx: bool = Form(default=True, description="Use ONNX for faster CPU inference"),
     api_key: str = Depends(get_api_key)
 ):
-    request_id = str(uuid.uuid4())[:8]  # Short unique ID for this request
+    request_id = str(uuid.uuid4())[:8]
     logger.info(f"[{request_id}] Request started: voice_name={voice_name}, text='{text[:50]}...', model={model_name}, onnx={use_onnx}")
 
     # Check if voice exists
@@ -77,45 +121,34 @@ async def generate_tts(
             detail=f"Voice file not found: {voice_info['wav_path']}"
         )
 
-    # Create a temporary file that won't auto-delete
-    fd, res_wav_path = tempfile.mkstemp(suffix='.wav')
+    # Enqueue the job
+    job = queue.enqueue(inference_task, voice_info, text, model_name, use_onnx, voice_name)
+    logger.info(f"[{request_id}] Job enqueued: {job.id}")
+
+    return JSONResponse({"job_id": job.id, "status": "queued"})
+
+@app.get("/jobs/{job_id}")
+async def get_job_result(job_id: str):
     try:
-        logger.info(f"[{request_id}] Building inference command")
-        # Build the inference command
-        module = "zipvoice.bin.infer_zipvoice_onnx" if use_onnx else "zipvoice.bin.infer_zipvoice"
-        cmd = [
-            "python", "-m", module,
-            "--model-name", model_name,
-            "--prompt-text", voice_info["transcription"],
-            "--prompt-wav", voice_info["wav_path"],
-            "--text", text,
-            "--res-wav-path", res_wav_path
-        ]
+        job = rq.Job.fetch(job_id, connection=redis_conn)
+    except rq.exceptions.NoSuchJobError:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-        logger.info(f"[{request_id}] Starting inference in executor")
-        # Run inference in thread pool
-        await asyncio.get_event_loop().run_in_executor(
-            executor,
-            lambda: run_inference(cmd)
-        )
-        logger.info(f"[{request_id}] Inference completed successfully")
-    except Exception as e:
-        os.close(fd)
-        os.remove(res_wav_path)
-        logger.error(f"[{request_id}] Inference failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+    status = job.get_status()
+    if status == 'failed':
+        raise HTTPException(status_code=500, detail=f"Job failed: {job.exc_info}")
 
-    logger.info(f"[{request_id}] Preparing to stream response")
-    # Stream the response back, with cleanup in finally
+    if status != 'finished':
+        return JSONResponse({"status": status})
+
+    # Job is finished: stream the result and cleanup
+    wav_bytes = job.meta['wav_bytes']
+    voice_name = job.meta.get('voice_name', 'output')
+
     def file_generator():
-        try:
-            with open(res_wav_path, "rb") as f:
-                while chunk := f.read(8192):
-                    yield chunk
-        finally:
-            os.close(fd)
-            os.remove(res_wav_path)  # Cleanup after streaming
-            logger.info(f"[{request_id}] Streaming completed and file cleaned up")
+        yield wav_bytes
+        # Cleanup job after successful fetch
+        job.delete()
 
     return StreamingResponse(
         file_generator(),
