@@ -24,3 +24,5 @@ uvicorn
 requests
 python-multipart
 onnxruntime
+
+zipvoice
