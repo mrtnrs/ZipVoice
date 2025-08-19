@@ -4,9 +4,11 @@ import tempfile
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import uuid
 from fastapi import FastAPI, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -55,6 +57,9 @@ async def generate_tts(
     use_onnx: bool = Form(default=True, description="Use ONNX for faster CPU inference"),
     api_key: str = Depends(get_api_key)
 ):
+    request_id = str(uuid.uuid4())[:8]  # Short unique ID for this request
+    logger.info(f"[{request_id}] Request started: voice_name={voice_name}, text='{text[:50]}...', model={model_name}, onnx={use_onnx}")
+
     # Check if voice exists
     if voice_name not in PREDEFINED_VOICES:
         available_voices = list(PREDEFINED_VOICES.keys())
@@ -75,6 +80,7 @@ async def generate_tts(
     # Create a temporary file that won't auto-delete
     fd, res_wav_path = tempfile.mkstemp(suffix='.wav')
     try:
+        logger.info(f"[{request_id}] Building inference command")
         # Build the inference command
         module = "zipvoice.bin.infer_zipvoice_onnx" if use_onnx else "zipvoice.bin.infer_zipvoice"
         cmd = [
@@ -86,17 +92,20 @@ async def generate_tts(
             "--res-wav-path", res_wav_path
         ]
 
+        logger.info(f"[{request_id}] Starting inference in executor")
         # Run inference in thread pool
         await asyncio.get_event_loop().run_in_executor(
             executor,
             lambda: run_inference(cmd)
         )
+        logger.info(f"[{request_id}] Inference completed successfully")
     except Exception as e:
         os.close(fd)
         os.remove(res_wav_path)
-        logger.error(f"Inference failed: {str(e)}")
+        logger.error(f"[{request_id}] Inference failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
+    logger.info(f"[{request_id}] Preparing to stream response")
     # Stream the response back, with cleanup in finally
     def file_generator():
         try:
@@ -106,6 +115,7 @@ async def generate_tts(
         finally:
             os.close(fd)
             os.remove(res_wav_path)  # Cleanup after streaming
+            logger.info(f"[{request_id}] Streaming completed and file cleaned up")
 
     return StreamingResponse(
         file_generator(),
