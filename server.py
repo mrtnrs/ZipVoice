@@ -1,13 +1,12 @@
 import os
 import subprocess
 import tempfile
-import shutil
-from fastapi import FastAPI, Form, HTTPException, Depends
-from fastapi.responses import Response, StreamingResponse
-from fastapi.security import APIKeyHeader
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import logging
+from fastapi import FastAPI, Form, HTTPException, Depends
+from fastapi.responses import StreamingResponse
+from fastapi.security import APIKeyHeader
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +39,14 @@ PREDEFINED_VOICES = {
     # Add more voices as needed
 }
 
+def run_inference(cmd):
+    """Run the inference command and handle output"""
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Inference failed: {result.stderr}")
+    elif result.stderr:
+        logger.warning(f"Inference warnings: {result.stderr}")
+
 @app.post("/tts")
 async def generate_tts(
     voice_name: str = Form(..., description="Name of the predefined voice"),
@@ -65,10 +72,9 @@ async def generate_tts(
             detail=f"Voice file not found: {voice_info['wav_path']}"
         )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Prepare output path
-        res_wav_path = os.path.join(tmpdir, "output.wav")
-
+    # Create a temporary file that won't auto-delete
+    fd, res_wav_path = tempfile.mkstemp(suffix='.wav')
+    try:
         # Build the inference command
         module = "zipvoice.bin.infer_zipvoice_onnx" if use_onnx else "zipvoice.bin.infer_zipvoice"
         cmd = [
@@ -81,33 +87,31 @@ async def generate_tts(
         ]
 
         # Run inference in thread pool
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                executor,
-                lambda: run_inference(cmd)
-        except Exception as e:
-            logger.error(f"Inference failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+        await asyncio.get_event_loop().run_in_executor(
+            executor,
+            lambda: run_inference(cmd)
+        )
+    except Exception as e:
+        os.close(fd)
+        os.remove(res_wav_path)
+        logger.error(f"Inference failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
-        # Stream the response back
-        def file_generator():
+    # Stream the response back, with cleanup in finally
+    def file_generator():
+        try:
             with open(res_wav_path, "rb") as f:
                 while chunk := f.read(8192):
                     yield chunk
+        finally:
+            os.close(fd)
+            os.remove(res_wav_path)  # Cleanup after streaming
 
-        return StreamingResponse(
-            file_generator(),
-            media_type="audio/wav",
-            headers={"Content-Disposition": f'attachment; filename="{voice_name}_output.wav"'}
-        )
-
-def run_inference(cmd):
-    """Run the inference command and handle output"""
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"Inference failed: {result.stderr}")
-    elif result.stderr:
-        logger.warning(f"Inference warnings: {result.stderr}")
+    return StreamingResponse(
+        file_generator(),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'attachment; filename="{voice_name}_output.wav"'}
+    )
 
 # Keep the custom endpoint for URL-based voices if needed
 @app.post("/tts/custom")
@@ -120,7 +124,7 @@ async def generate_tts_custom(
     api_key: str = Depends(get_api_key)
 ):
     # Implementation for custom voices (similar to your original code)
-    pass
+    raise HTTPException(status_code=501, detail="Custom TTS endpoint not implemented yet")
 
 @app.get("/voices")
 def list_voices():
