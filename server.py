@@ -36,7 +36,7 @@ VOICES_DIR = "voices"  # Directory where voice files are stored
 PREDEFINED_VOICES = {
     "voice_one": {
         "wav_path": os.path.join(VOICES_DIR, "voice_one.wav"),
-        "transcription": "This is the transcription for voice one"
+        "transcription": "Some call me nature. Others call me mother nature. I've been here for over 4.5 billions years. Twenty-two-thousand-five-hundred times longer than you."
     },
     "voice_two": {
         "wav_path": os.path.join(VOICES_DIR, "voice_two.wav"),
@@ -72,6 +72,17 @@ def inference_task(job_id, voice_info, text, model_name, use_onnx, voice_name):
             "--text", text,
             "--res-wav-path", res_wav_path
         ]
+
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            if use_onnx:
+                cmd.extend(["--provider", "CUDAExecutionProvider"])
+                logger.info(f"[{job_id}] Using CUDA with ONNX")
+            else:
+                cmd.extend(["--device", "cuda"])
+                logger.info(f"[{job_id}] Using CUDA with PyTorch")
+        else:
+            logger.info(f"[{job_id}] CUDA not available, using CPU")
 
         logger.info(f"[{job_id}] Running inference command")
         run_inference(cmd)
