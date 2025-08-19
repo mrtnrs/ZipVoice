@@ -1,7 +1,6 @@
 import os
 import subprocess
 import tempfile
-import asyncio
 import logging
 import uuid
 import io
@@ -9,8 +8,7 @@ from fastapi import FastAPI, Form, HTTPException, Depends, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from concurrent.futures import ThreadPoolExecutor
-from redis import Redis
-import rq
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,12 +24,12 @@ def get_api_key(api_key: str = Depends(api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return api_key
 
-# Redis and RQ setup
-redis_conn = Redis.from_url(os.getenv("REDIS_URL"))
-queue = rq.Queue(connection=redis_conn)
-
-# Thread pool for CPU-intensive operations (used inside worker if needed)
+# Thread pool for CPU-intensive operations
 executor = ThreadPoolExecutor(max_workers=2)
+
+# In-memory job storage (since no Redis)
+jobs = {}
+jobs_lock = threading.Lock()
 
 # Predefined voices mapping
 VOICES_DIR = "voices"  # Directory where voice files are stored
@@ -55,11 +53,12 @@ def run_inference(cmd):
     elif result.stderr:
         logger.warning(f"Inference warnings: {result.stderr}")
 
-def inference_task(voice_info, text, model_name, use_onnx, voice_name):
-    """Task function to run in RQ worker"""
-    job = rq.get_current_job()
-    job_id = job.id  # For logging
+def inference_task(job_id, voice_info, text, model_name, use_onnx, voice_name):
+    """Task function to run in thread"""
     logger.info(f"[{job_id}] Starting inference task")
+
+    with jobs_lock:
+        jobs[job_id]['status'] = 'started'
 
     fd, res_wav_path = tempfile.mkstemp(suffix='.wav')
     try:
@@ -80,14 +79,16 @@ def inference_task(voice_info, text, model_name, use_onnx, voice_name):
         with open(res_wav_path, "rb") as f:
             wav_bytes = f.read()
 
-        job.meta['status'] = 'finished'
-        job.meta['wav_bytes'] = wav_bytes
-        job.meta['voice_name'] = voice_name
-        job.save_meta()
+        with jobs_lock:
+            jobs[job_id]['status'] = 'finished'
+            jobs[job_id]['wav_bytes'] = wav_bytes
+            jobs[job_id]['voice_name'] = voice_name
         logger.info(f"[{job_id}] Inference task completed successfully")
     except Exception as e:
         logger.error(f"[{job_id}] Inference task failed: {str(e)}")
-        raise  # RQ will mark as failed
+        with jobs_lock:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['exc_info'] = str(e)
     finally:
         os.close(fd)
         if os.path.exists(res_wav_path):
@@ -121,34 +122,42 @@ async def generate_tts(
             detail=f"Voice file not found: {voice_info['wav_path']}"
         )
 
-    # Enqueue the job
-    job = queue.enqueue(inference_task, voice_info, text, model_name, use_onnx, voice_name)
-    logger.info(f"[{request_id}] Job enqueued: {job.id}")
+    # Create job in memory
+    job_id = str(uuid.uuid4())
+    with jobs_lock:
+        jobs[job_id] = {'status': 'queued'}
 
-    return JSONResponse({"job_id": job.id, "status": "queued"})
+    # Submit to executor
+    executor.submit(inference_task, job_id, voice_info, text, model_name, use_onnx, voice_name)
+    logger.info(f"[{request_id}] Job enqueued: {job_id}")
+
+    return JSONResponse({"job_id": job_id, "status": "queued"})
 
 @app.get("/jobs/{job_id}")
 async def get_job_result(job_id: str):
-    try:
-        job = rq.Job.fetch(job_id, connection=redis_conn)
-    except rq.exceptions.NoSuchJobError:
+    with jobs_lock:
+        job = jobs.get(job_id)
+    
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    status = job.get_status()
+    status = job['status']
     if status == 'failed':
-        raise HTTPException(status_code=500, detail=f"Job failed: {job.exc_info}")
+        raise HTTPException(status_code=500, detail=f"Job failed: {job.get('exc_info', 'Unknown error')}")
 
     if status != 'finished':
         return JSONResponse({"status": status})
 
     # Job is finished: stream the result and cleanup
-    wav_bytes = job.meta['wav_bytes']
-    voice_name = job.meta.get('voice_name', 'output')
+    wav_bytes = job['wav_bytes']
+    voice_name = job.get('voice_name', 'output')
 
     def file_generator():
         yield wav_bytes
         # Cleanup job after successful fetch
-        job.delete()
+        with jobs_lock:
+            if job_id in jobs:
+                del jobs[job_id]
 
     return StreamingResponse(
         file_generator(),
