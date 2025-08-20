@@ -78,11 +78,9 @@ def inference_task(job_id, voice_info, text, model_name, use_onnx, voice_name):
         cuda_available = torch.cuda.is_available()
         if cuda_available:
             if use_onnx:
-                cmd.extend(["--provider", "CUDAExecutionProvider"])
-                logger.info(f"[{job_id}] Using CUDA with ONNX")
+                logger.info(f"[{job_id}] CUDA available, but ONNX path defaults to CPU (no provider flag supported)")
             else:
-                cmd.extend(["--device", "cuda"])
-                logger.info(f"[{job_id}] Using CUDA with PyTorch")
+                logger.info(f"[{job_id}] CUDA available; PyTorch path should use it automatically")
         else:
             logger.info(f"[{job_id}] CUDA not available, using CPU")
 
@@ -106,6 +104,7 @@ def inference_task(job_id, voice_info, text, model_name, use_onnx, voice_name):
         os.close(fd)
         if os.path.exists(res_wav_path):
             os.remove(res_wav_path)
+
 
 @app.post("/tts", status_code=status.HTTP_202_ACCEPTED)
 async def generate_tts(
